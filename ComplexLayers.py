@@ -1,11 +1,21 @@
 import tensorflow as tf
-from cvnn.layers import ComplexDense
-
 from ComplexFunctions import ComplexSoftmax, ComplexCardioid
 
 import numpy as np
 import pickle
 copy_class = lambda class_obj: pickle.loads(pickle.dumps(class_obj))
+
+def complex_initializer(base_initializer, dtype=tf.float32):
+    f_real = copy_class(base_initializer)
+    f_imag = copy_class(base_initializer)
+
+    def initializer(*args, **kwargs):
+        kwargs['dtype'] = dtype
+        real = f_real(*args, **kwargs)
+        imag = f_imag(*args, **kwargs)
+        return tf.complex(real, imag)
+
+    return initializer
 
 #%%
 def magtheta_2_spec(inputs):
@@ -152,46 +162,6 @@ class ComplexEmbedding2D(ComplexEmbedding):
         self.tau = tf.expand_dims(tf.sqrt(tf.math.square(tau_x) + tf.math.square(tau_y)), axis=-1)
 
 #%%
-class BaseGLU(tf.keras.layers.Layer):
-    '''
-        Gated Linear Unit : GLU Variants Improve Transformer
-        outputs = act_fun(inputs W + b) x (inputs V + c)
-        For inputs with more than 2 dimensions, first flatten, then dense, finally reshape back
-    '''
-    def __init__(self, units=None, act_fun="sigmoid", **kwargs):
-        super().__init__(**kwargs)
-        self.units = units
-        self.act_fun  = tf.keras.layers.Layer.Activation(act_fun)
-    
-    def build(self, input_shape):
-        if self.units is None:
-            self.units = input_shape[-1]
-    
-    @tf.function
-    def call(self, inputs):
-        x = self.linear(inputs)
-        outputs = x[...,:self.units] * self.act_fun(x[...,self.units:])
-        
-        return outputs
-
-class GLU(BaseGLU):
-    def __init__(self, units=None, act_fun="sigmoid", **kwargs):
-        super().__init__(units, act_fun, **kwargs)
-    
-    def build(self, input_shape):
-        super().build(input_shape)
-        self.linear = tf.keras.layers.Layer.Dense(self.units*2)
-    
-class ComplexGLU(BaseGLU):
-    def __init__(self, units=None, act_fun=ComplexCardioid, **kwargs):
-        super().__init__(units, act_fun, **kwargs)
-    
-    def build(self, input_shape):
-        super().build(input_shape)
-        self.linear = ComplexDense(self.units*2)
-
-
-#%%
 class BaseAttention(tf.keras.layers.Layer):
     ''' Base class for Single/Multi-head attention
         If use_scale, we compute alpha x score with alpha being a scalar;
@@ -217,44 +187,42 @@ class BaseAttention(tf.keras.layers.Layer):
         
         self.kernel_regularizer = tf.keras.regularizers.get(kernel_regularizer)
         self.alpha_regularizer = tf.keras.regularizers.get(alpha_regularizer)
+        self.init = lambda x: copy_class(x)
     
-    def build_weight(self, K_shape, add_shape=(), add_name=""):
+    def build_weight(self, K_shape, add_shape=()):
         *_, T, D_Model = K_shape
-        W_Q = self.add_weight(
-            name=f'query weight{add_name}',
+        self.W_Q = self.add_weight(
+            name='query weight',
             shape=add_shape + (D_Model, self.key_dim),
-            initializer=copy_class(self.kernel_initializer),
+            initializer=self.init(self.kernel_initializer),
             regularizer=self.kernel_regularizer,
             trainable=True
         )
         
-        W_V = self.add_weight(
-            name=f'value weight{add_name}',
+        self.W_V = self.add_weight(
+            name='value weight',
             shape=add_shape + (D_Model, self.value_dim),
-            initializer=copy_class(self.kernel_initializer),
+            initializer=self.init(self.kernel_initializer),
             regularizer=self.kernel_regularizer,
             trainable=True
         )
         
-        W_K = self.add_weight(
-            name=f'key weight{add_name}',
+        self.W_K = self.add_weight(
+            name='key weight',
             shape=add_shape + (D_Model, self.key_dim),
-            initializer=copy_class(self.kernel_initializer),
+            initializer=self.init(self.kernel_initializer),
             regularizer=self.kernel_regularizer,
             trainable=True
         )
         
-        alpha = 1.
         if self.use_scale:
-            alpha = self.add_weight(
-                name=f'alpha{add_name}',
+            self.alpha = self.add_weight(
+                name='alpha',
                 shape=add_shape + (T, 1),
-                initializer=copy_class(self.alpha_initializer),
+                initializer=self.init(self.alpha_initializer),
                 regularizer=self.alpha_regularizer,
                 trainable=True
             )
-            
-        return W_Q, W_V, W_K, alpha
     
     def _get_attention(self, query, value, key):
         query_W = tf.matmul(query, self.W_Q)
@@ -297,10 +265,10 @@ class BaseAttention(tf.keras.layers.Layer):
 class Attention(BaseAttention):
     def __init__(self, key_dim, **kwargs):
         super().__init__(key_dim, **kwargs)
+        self.perm = [0, 2, 1]
         
         self.sqrt_D = tf.sqrt(float(key_dim))
         self.softmax = tf.nn.softmax
-        self.perm = [0, 2, 1]
         
     def build(self, input_shape):
         # input_shape: [(batch_size, T, D_Model_Q), (batch_size, T, D_Model_V)] or 
@@ -310,7 +278,7 @@ class Attention(BaseAttention):
         else:
             Q_shape, V_shape, K_shape = input_shape
         
-        self.W_Q, self.W_V, self.W_K, self.alpha = self.build_weight(K_shape)
+        self.build_weight(K_shape)
         if self.use_causal_mask:
             T = K_shape[1]
             lower_tri = tf.linalg.LinearOperatorLowerTriangular(tf.ones((1, T, T))).to_dense()
@@ -338,65 +306,18 @@ class Attention(BaseAttention):
         outputs = self._get_attention(query, value, key)
         return outputs
     
-class ComplexAttention(BaseAttention):
-    ''' Single head attention
-        If use_scale, we compute alpha x score with alpha being a scalar
-        
-        If use_causal_mask, it creates a lower triangular matrix from scores and 
-        prevents the flow of future information to the past
-    
-    '''
-    def __init__(self, key_dim, **kwargs):
-        super().__init__(key_dim, **kwargs)
+class ComplexAttention(Attention):
+    def __init__(self, key_dim, dtype=tf.complex64, **kwargs):
+        super().__init__(key_dim, dtype=dtype, **kwargs)
         
         self.sqrt_D = tf.cast(tf.sqrt(float(key_dim)), dtype=tf.complex64)
         self.softmax = lambda x: tf.complex(ComplexSoftmax(x), 0.)
-        self.perm = [0, 2, 1]
+        self.init = complex_initializer
         
     def build(self, input_shape):
-        # input_shape: [(batch_size, T, D_Model_Q), (batch_size, T, D_Model_V)] or 
-        # [(batch_size, T, D_Model_Q), (batch_size, T, D_Model_V), (batch_size, T, D_Model_K)]
-        if len(input_shape) == 2:
-            K_shape, V_shape = input_shape
-        else:
-            Q_shape, V_shape, K_shape = input_shape
-        
-        self.W_Q_r, self.W_V_r, self.W_K_r, self.alpha_r = self.build_weight(K_shape, add_name=" real")
-        self.W_Q_i, self.W_V_i, self.W_K_i, self.alpha_i = self.build_weight(K_shape, add_name=" imag")
-        
+        super().build(input_shape)
         if self.use_causal_mask:
-            T = K_shape[1]
-            lower_tri = tf.linalg.LinearOperatorLowerTriangular(tf.ones((1, T, T))).to_dense()
-            causal_mask = -1e9 * tf.cast(tf.less(lower_tri, 0.5), tf.float32)
-            self.causal_mask = tf.complex(causal_mask, causal_mask)
-
-    @tf.function
-    def call(self, inputs):
-        '''
-        Parameters
-        ----------
-        inputs : list of tensors [X_Q, X_V] or [X_Q, X_V, X_K]
-        X_Q : (Batch_size, T, D_Model_Q)
-        X_V : (Batch_size, T, D_Model_V)
-        X_K : (Batch_size, T, D_Model_K)
-
-        X_Q W_Q : Query tensor of shape (Batch_size, T, D_Q)
-        X_V W_V : Value tensor of shape (Batch_size, T, D_V)
-        X_K W_K : Key tensor of shape (Batch_size, T, D_K)
-        '''
-        if len(inputs) == 2:
-            query, value = inputs
-            key = value
-        else:
-            query, value, key = inputs
-            
-        self.W_Q = tf.complex(self.W_Q_r, self.W_Q_i)
-        self.W_V = tf.complex(self.W_V_r, self.W_V_i)
-        self.W_K = tf.complex(self.W_K_r, self.W_K_i)
-        self.alpha = tf.complex(self.alpha_r, self.alpha_i)
-        
-        outputs = self._get_attention(query, value, key)
-        return outputs
+            self.causal_mask = tf.complex(self.causal_mask, self.causal_mask)
 
 #%% 
 class MultiHeadAttention(BaseAttention):
@@ -406,11 +327,16 @@ class MultiHeadAttention(BaseAttention):
                  **kwargs
                  ):
         super().__init__(key_dim, **kwargs)
+        # self-attention
+        self.attention_fun = self._get_attention
         
+        # multi-head
         self.n_heads = n_heads
+        self.perm = [0, 1, 3, 2]
+        
+        # real
         self.sqrt_D = tf.cast(tf.sqrt(float(key_dim)), dtype=tf.float32)
         self.softmax = tf.nn.softmax
-        self.perm = [0, 1, 3, 2]
     
     def build(self, input_shape):
         # input_shape: [(batch_size, T, D_Model_Q), (batch_size, T, D_Model_V)] or 
@@ -421,12 +347,12 @@ class MultiHeadAttention(BaseAttention):
             Q_shape, V_shape, K_shape = input_shape
             
         _, self.T, D_Model = K_shape
-        self.W_Q, self.W_V, self.W_K, self.alpha = self.build_weight(K_shape, add_shape=(self.n_heads,))
+        self.build_weight(K_shape, add_shape=(self.n_heads,))
         
         self.W = self.add_weight(
             name='head weight',
             shape=(self.n_heads, self.value_dim, D_Model),
-            initializer=copy_class(self.kernel_initializer),
+            initializer=self.init(self.kernel_initializer),
             regularizer=self.kernel_regularizer,
             trainable=True
         )
@@ -458,143 +384,69 @@ class MultiHeadAttention(BaseAttention):
         query = tf.expand_dims(query, axis=1)
         value = tf.expand_dims(value, axis=1)
         key   = tf.expand_dims(key, axis=1)
-        heads = self._get_attention(query, value, key)
+        heads = self.attention_fun(query, value, key)
         outputs = tf.reduce_sum(tf.matmul(heads, self.W), axis=1)
         
         return outputs
 
-class ComplexMultiHeadAttention(BaseAttention):
+class ComplexMultiHeadAttention(MultiHeadAttention):
     def __init__(self, 
                  n_heads,
                  key_dim, 
+                 dtype=tf.complex64,
                  **kwargs
                  ):
-        super().__init__(key_dim, **kwargs)
-        
+        super().__init__(n_heads, key_dim, dtype=dtype, **kwargs)
+        # multi-heads
         self.n_heads = n_heads
+        self.perm = [0, 1, 3, 2]
+        
+        # complex
         self.sqrt_D = tf.cast(tf.sqrt(float(key_dim)), dtype=tf.complex64)
         self.softmax = lambda x: tf.complex(ComplexSoftmax(x), 0.)
-        self.perm = [0, 1, 3, 2]
+        self.init = complex_initializer
     
     def build(self, input_shape):
-        # input_shape: [(batch_size, T, D_Model_Q), (batch_size, T, D_Model_V)] or 
-        # [(batch_size, T, D_Model_Q), (batch_size, T, D_Model_V), (batch_size, T, D_Model_K)]
-        if len(input_shape) == 2:
-            K_shape, V_shape = input_shape
-        else:
-            Q_shape, V_shape, K_shape = input_shape
-        
-        _, self.T, D_Model = K_shape
-        self.W_Q_r, self.W_V_r, self.W_K_r, self.alpha_r = self.build_weight(K_shape, add_shape=(self.n_heads,), add_name=" real")
-        self.W_Q_i, self.W_V_i, self.W_K_i, self.alpha_i = self.build_weight(K_shape, add_shape=(self.n_heads,), add_name=" imag")
-        
-        self.W_r = self.add_weight(
-            name='heads weight real',
-            shape=(self.n_heads, self.value_dim, D_Model),
-            initializer=copy_class(self.kernel_initializer),
-            regularizer=self.kernel_regularizer,
-            trainable=True
-        )
-        
-        self.W_i = self.add_weight(
-            name='heads weight imag',
-            shape=(self.n_heads, self.value_dim, D_Model),
-            initializer=copy_class(self.kernel_initializer),
-            regularizer=self.kernel_regularizer,
-            trainable=True
-        )
-        
+        super().build(input_shape)
         if self.use_causal_mask:
-            lower_tri = tf.linalg.LinearOperatorLowerTriangular(tf.ones((1, 1, self.T, self.T))).to_dense()
-            causal_mask = -1e9 * tf.cast(tf.less(lower_tri, 0.5), tf.float32)
-            self.causal_mask = tf.complex(causal_mask, causal_mask)
-
-    @tf.function
-    def call(self, inputs):
-        '''
-        Parameters
-        ----------
-        inputs : list of tensors [X_Q, X_V] or [X_Q, X_V, X_K]
-        X_Q : (Batch_size, T, D_Model_Q)
-        X_V : (Batch_size, T, D_Model_V)
-        X_K : (Batch_size, T, D_Model_K)
-
-        X_Q W_Q : Query tensor of shape (Batch_size, T, D_Q)
-        X_V W_V : Value tensor of shape (Batch_size, T, D_V)
-        X_K W_K : Key tensor of shape (Batch_size, T, D_K)
-        '''
-        if len(inputs) == 2:
-            query, value = inputs
-            key = value
-        else:
-            query, value, key = inputs
-        
-        self.W_Q = tf.complex(self.W_Q_r, self.W_Q_i)
-        self.W_V = tf.complex(self.W_V_r, self.W_V_i)
-        self.W_K = tf.complex(self.W_K_r, self.W_K_i)
-        self.alpha = tf.complex(self.alpha_r, self.alpha_i)
-        
-        query = tf.expand_dims(query, axis=1)
-        value = tf.expand_dims(value, axis=1)
-        key   = tf.expand_dims(key, axis=1)
-        heads = self._get_attention(query, value, key)
-        W = tf.complex(self.W_r, self.W_i)
-        outputs = tf.reduce_sum(tf.matmul(heads, W), axis=1)
-        
-        return outputs
+            self.causal_mask = tf.complex(self.causal_mask, self.causal_mask)
 
 #%%
-class BaseRelativePosition(tf.keras.layers.Layer):
-    def __init__(self, seq_length, units, clip_val=2, 
+class RelativePosition(tf.keras.layers.Layer):
+    def __init__(self, seq_length, units, clip_val=2,
                  embeddings_initializer='glorot_uniform',
-                 embeddings_regularizer=None):
-        super().__init__()
+                 embeddings_regularizer=None, **kwargs):
+        super().__init__(**kwargs)
         self.units = units
         self.clip_val = clip_val
         
         self.embedding_initializer = tf.keras.initializers.get(embeddings_initializer)
         self.embedding_regularizer = tf.keras.regularizers.get(embeddings_regularizer)
     
-        tau_K = tf.range(seq_length, dtype=self.dtype)
+        tau_K = tf.range(seq_length, dtype=tf.float32)
         relative_mat = tau_K[None,:] - tau_K[:,None]
         relative_mat = tf.clip_by_value(relative_mat, -self.clip_val, self.clip_val)
         self.relative_mat = tf.cast(relative_mat + self.clip_val, dtype=tf.int32)
-    
-    def build_embedding(self, add_name=""):
-        return self.add_weight(
-            name=f'embedding{add_name}',
+        self.reshaped_mat = tf.reshape(self.relative_mat, (-1, 1))
+        self.embed_shape = self.relative_mat.shape + (self.units,)
+        
+        if self.dtype in [tf.complex64, tf.complex128]:
+            self.init = complex_initializer
+        else:
+            self.init = copy_class
+            
+        self.embedding = self.add_weight(
+            name='embedding',
             shape=(2*self.clip_val + 1, self.units),
-            initializer=copy_class(self.embedding_initializer),
+            initializer=self.init(self.embedding_initializer),
             regularizer=self.embedding_regularizer,
             trainable=True
         )
 
     def _get_embedding(self):
-        embedding = tf.gather_nd(self.embedding, tf.reshape(self.relative_mat, (-1, 1)))
-        embedding = tf.reshape(embedding, self.relative_mat.shape + (self.units,))
+        embedding = tf.gather_nd(self.embedding, self.reshaped_mat)
+        embedding = tf.reshape(embedding, self.embed_shape)
         return embedding
-        
-class RelativePosition(BaseRelativePosition):
-    def __init__(self, seq_length, units, clip_val=2, 
-                 embeddings_initializer='glorot_uniform',
-                 embeddings_regularizer=None):
-        super().__init__(seq_length, units, clip_val=clip_val, 
-                         embeddings_initializer=embeddings_initializer, 
-                         embeddings_regularizer=embeddings_regularizer)
-        
-        self.embedding = self.build_embedding()
-
-class ComplexRelativePosition(BaseRelativePosition):
-    def __init__(self, seq_length, units, clip_val=2, 
-                 embeddings_initializer='glorot_uniform',
-                 embeddings_regularizer=None):
-        super().__init__(seq_length, units, clip_val=clip_val, 
-                         embeddings_initializer=embeddings_initializer, 
-                         embeddings_regularizer=embeddings_regularizer)
-        
-        self.embedding_r = self.build_embedding(add_name=" real")
-        self.embedding_i = self.build_embedding(add_name=" imag")
-
 
 class RelativeMultiHeadAttention(MultiHeadAttention):
     def __init__(self, 
@@ -610,6 +462,7 @@ class RelativeMultiHeadAttention(MultiHeadAttention):
         self.clip_val = clip_val
         self.embeddings_initializer = embeddings_initializer
         self.embeddings_regularizer = embeddings_regularizer
+        self.attention_fun = self._get_relative_attention
         
     def build(self, input_shape):
         super().build(input_shape)
@@ -619,34 +472,6 @@ class RelativeMultiHeadAttention(MultiHeadAttention):
         self.relative_S = RelativePosition(self.T, self.value_dim, self.clip_val, 
                                            self.embeddings_initializer, 
                                            self.embeddings_regularizer)
-
-    @tf.function
-    def call(self, inputs):
-        '''
-        Parameters
-        ----------
-        inputs : list of tensors [X_Q, X_V] or [X_Q, X_V, X_K]
-        X_Q : (Batch_size, T, D_Model_Q)
-        X_V : (Batch_size, T, D_Model_V)
-        X_K : (Batch_size, T, D_Model_K)
-
-        X_Q W_Q : Query tensor of shape (Batch_size, T, D_Q)
-        X_V W_V : Value tensor of shape (Batch_size, T, D_V)
-        X_K W_K : Key tensor of shape (Batch_size, T, D_K)
-        '''
-        if len(inputs) == 2:
-            query, value = inputs
-            key = value
-        else:
-            query, value, key = inputs
-        
-        query = tf.expand_dims(query, axis=1)
-        value = tf.expand_dims(value, axis=1)
-        key   = tf.expand_dims(key, axis=1)
-        heads = self._get_relative_attention(query, value, key)
-        outputs = tf.reduce_sum(tf.matmul(heads, self.W), axis=1)
-        
-        return outputs
     
 class ComplexRelativeMultiHeadAttention(ComplexMultiHeadAttention):
     def __init__(self, 
@@ -655,57 +480,25 @@ class ComplexRelativeMultiHeadAttention(ComplexMultiHeadAttention):
                  clip_val=2,
                  embeddings_initializer='glorot_uniform',
                  embeddings_regularizer=None,
+                 dtype=tf.complex64,
                  **kwargs
                  ):
-        super().__init__(n_heads, key_dim, **kwargs)
+        super().__init__(n_heads, key_dim, dtype=dtype, **kwargs)
         self.clip_val = clip_val
         self.embeddings_initializer = embeddings_initializer
         self.embeddings_regularizer = embeddings_regularizer
-
+        self.attention_fun = self._get_relative_attention
+        
     def build(self, input_shape):
         super().build(input_shape)
-        self.relative_Q = ComplexRelativePosition(self.T, self.key_dim, self.clip_val, 
-                                                  self.embeddings_initializer, 
-                                                  self.embeddings_regularizer)
-        self.relative_S = ComplexRelativePosition(self.T, self.value_dim, self.clip_val, 
-                                                  self.embeddings_initializer, 
-                                                  self.embeddings_regularizer)
-
-    @tf.function
-    def call(self, inputs):
-        '''
-        Parameters
-        ----------
-        inputs : list of tensors [X_Q, X_V] or [X_Q, X_V, X_K]
-        X_Q : (Batch_size, T, D_Model_Q)
-        X_V : (Batch_size, T, D_Model_V)
-        X_K : (Batch_size, T, D_Model_K)
-
-        X_Q W_Q : Query tensor of shape (Batch_size, T, D_Q)
-        X_V W_V : Value tensor of shape (Batch_size, T, D_V)
-        X_K W_K : Key tensor of shape (Batch_size, T, D_K)
-        '''
-        if len(inputs) == 2:
-            query, value = inputs
-            key = value
-        else:
-            query, value, key = inputs
-        
-        self.W_Q = tf.complex(self.W_Q_r, self.W_Q_i)
-        self.W_V = tf.complex(self.W_V_r, self.W_V_i)
-        self.W_K = tf.complex(self.W_K_r, self.W_K_i)
-        self.alpha = tf.complex(self.alpha_r, self.alpha_i)
-        self.relative_Q.embedding = tf.complex(self.relative_Q.embedding_r, self.relative_Q.embedding_i)
-        self.relative_S.embedding = tf.complex(self.relative_S.embedding_r, self.relative_S.embedding_i)
-        
-        query = tf.expand_dims(query, axis=1)
-        value = tf.expand_dims(value, axis=1)
-        key   = tf.expand_dims(key, axis=1)
-        heads = self._get_relative_attention(query, value, key)
-        W = tf.complex(self.W_r, self.W_i)
-        outputs = tf.reduce_sum(tf.matmul(heads, W), axis=1)
-        
-        return outputs
+        self.relative_Q = RelativePosition(self.T, self.key_dim, self.clip_val, 
+                                           self.embeddings_initializer, 
+                                           self.embeddings_regularizer,
+                                           dtype=self.dtype)
+        self.relative_S = RelativePosition(self.T, self.value_dim, self.clip_val, 
+                                           self.embeddings_initializer, 
+                                           self.embeddings_regularizer,
+                                           dtype=self.dtype)
 
 #%%
 class LayerScale(tf.keras.layers.Layer):
@@ -714,13 +507,14 @@ class LayerScale(tf.keras.layers.Layer):
         super().__init__(**kwargs)
         self.gamma_initializer = tf.keras.initializers.Constant(epsilon)
         self.gamma_regularizer = tf.keras.regularizers.get(gamma_regularizer)
+        self.init = lambda x: copy_class(x)
     
     def build(self, input_shape):
         shape = input_shape[-1:]
         self.gamma = self.add_weight(
             name="gamma",
             shape=shape,
-            initializer=self.gamma_initializer, 
+            initializer=self.init(self.gamma_initializer), 
             regularizer=self.gamma_regularizer,
             trainable=True
             )
@@ -730,197 +524,195 @@ class LayerScale(tf.keras.layers.Layer):
         outputs = tf.matmul(inputs, tf.expand_dims(tf.linalg.diag(self.gamma), 0))
         return outputs
 
-class ComplexLayerScale(tf.keras.layers.Layer):
+class ComplexLayerScale(LayerScale):
     # per-channel reweighting with complex numbers
-    def __init__(self, epsilon=1e-4, gamma_regularizer=None, **kwargs):
-        super().__init__(**kwargs)
-        self.gamma_initializer = tf.keras.initializers.Constant(epsilon)
-        self.gamma_regularizer = tf.keras.regularizers.get(gamma_regularizer)
-        
-    
-    def build(self, input_shape):
-        shape = input_shape[-1:]
-        self.gamma_r = self.add_weight(
-            name="gamma real",
-            shape=shape,
-            initializer=copy_class(self.gamma_initializer),
-            regularizer=self.gamma_regularizer,
-            trainable=True
-            )
-        self.gamma_i = self.add_weight(
-            name="gamma imag",
-            shape=shape,
-            initializer=copy_class(self.gamma_initializer), 
-            regularizer=self.gamma_regularizer,
-            trainable=True
-            )
-    
-    @tf.function
-    def call(self, inputs, training=None):
-        diag_gamma = tf.linalg.diag(tf.complex(self.gamma_r, self.gamma_i))
-        outputs = tf.matmul(inputs, tf.expand_dims(diag_gamma, 0))
-        return outputs
+    def __init__(self, dtype=tf.complex64, **kwargs):
+        super().__init__(dtype=dtype, **kwargs)
+        self.init = complex_initializer
 
 #%%
-class BaseNormalization(tf.keras.layers.Layer):
-    def __init__(self,
-                 axis=-1,
-                 epsilon=0.001,
-                 center=True,
-                 scale=True,
+from tensorflow.keras.layers import Dense, GroupNormalization, LayerNormalization
+class ComplexDense(Dense):
+    def __init__(self, units, dtype=tf.complex64, 
+                 kernel_initializer="glorot_uniform",
+                 bias_initializer="zeros",
+                 **kwargs):
+        kernel_initializer=complex_initializer(tf.keras.initializers.get(kernel_initializer))
+        bias_initializer=complex_initializer(tf.keras.initializers.get(bias_initializer))
+        super().__init__(units, dtype=dtype, 
+                         kernel_initializer=kernel_initializer,
+                         bias_initializer=bias_initializer, 
+                         **kwargs)
+
+#%%
+class BaseGLU(tf.keras.layers.Layer):
+    '''
+        Gated Linear Unit : GLU Variants Improve Transformer
+        outputs = act_fun(inputs W + b) x (inputs V + c)
+        For inputs with more than 2 dimensions, first flatten, then dense, finally reshape back
+    '''
+    def __init__(self, units=None, act_fun="sigmoid", **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.act_fun  = tf.keras.layers.Layer.Activation(act_fun)
+    
+    def build(self, input_shape):
+        if self.units is None:
+            self.units = input_shape[-1]
+    
+    @tf.function
+    def call(self, inputs):
+        x = self.linear(inputs)
+        outputs = x[...,:self.units] * self.act_fun(x[...,self.units:])
+        
+        return outputs
+
+class GLU(BaseGLU):
+    def __init__(self, units=None, act_fun="sigmoid", **kwargs):
+        super().__init__(units, act_fun, **kwargs)
+    
+    def build(self, input_shape):
+        super().build(input_shape)
+        self.linear = Dense(self.units*2)
+    
+class ComplexGLU(BaseGLU):
+    def __init__(self, units=None, act_fun=ComplexCardioid, **kwargs):
+        super().__init__(units, act_fun, **kwargs)
+    
+    def build(self, input_shape):
+        super().build(input_shape)
+        self.linear = ComplexDense(self.units*2)
+        
+#%%
+class ComplexLayerNormalization(LayerNormalization):
+    def __init__(self, axis=-1, dtype=tf.complex64, 
                  gamma_initializer="ones",
                  beta_initializer="zeros",
-                 gamma_regularizer=None,
-                 beta_regularizer=None,
                  **kwargs):
+        gamma_initializer = complex_initializer(tf.keras.initializers.get(gamma_initializer))
+        beta_initializer = complex_initializer(tf.keras.initializers.get(beta_initializer))
+        super().__init__(groups=1, axis=axis, dtype=dtype, 
+                         gamma_initializer=gamma_initializer,
+                         beta_initializer=beta_initializer
+                         **kwargs)
 
-        super().__init__(**kwargs)
-        if isinstance(axis, int):
-            axis = [axis]
-        self.axis = list(axis)
-        self.epsilon = epsilon
-        self.center = center
-        self.scale = scale
+class InstanceNormalization(GroupNormalization):
+    def __init__(self, axis=-1, **kwargs):
+        super().__init__(groups=-1, axis=axis, **kwargs)
+
+class ComplexInstanceNormalization(GroupNormalization):
+    def __init__(self, axis=-1, dtype=tf.complex64, 
+                 gamma_initializer="ones",
+                 beta_initializer="zeros",
+                 **kwargs):
+        gamma_initializer = complex_initializer(tf.keras.initializers.get(gamma_initializer))
+        beta_initializer = complex_initializer(tf.keras.initializers.get(beta_initializer))
+        super().__init__(groups=-1, axis=axis, dtype=dtype, 
+                         gamma_initializer=gamma_initializer,
+                         beta_initializer=beta_initializer
+                         **kwargs)
+
+# class BaseNormalization(tf.keras.layers.Layer):
+#     def __init__(self,
+#                  axis=-1,
+#                  epsilon=0.001,
+#                  center=True,
+#                  scale=True,
+#                  gamma_initializer="ones",
+#                  beta_initializer="zeros",
+#                  gamma_regularizer=None,
+#                  beta_regularizer=None,
+#                  **kwargs):
+
+#         super().__init__(**kwargs)
+#         if isinstance(axis, int):
+#             axis = [axis]
+#         self.axis = list(axis)
+#         self.epsilon = epsilon
+#         self.center = center
+#         self.scale = scale
         
-        self.gamma_initializer = tf.keras.initializers.get(gamma_initializer)
-        self.beta_initializer = tf.keras.initializers.get(beta_initializer)
+#         self.gamma_initializer = tf.keras.initializers.get(gamma_initializer)
+#         self.beta_initializer = tf.keras.initializers.get(beta_initializer)
         
-        self.gamma_regularizer = tf.keras.regularizers.get(gamma_regularizer)
-        self.beta_regularizer = tf.keras.regularizers.get(beta_regularizer)
+#         self.gamma_regularizer = tf.keras.regularizers.get(gamma_regularizer)
+#         self.beta_regularizer = tf.keras.regularizers.get(beta_regularizer)
+#         self.init = lambda x: copy_class(x)
 
-    def build(self, input_shape):
-        self.axis = [len(input_shape) + ax if ax < 0 else ax for ax in self.axis]
-        self.shape = tuple(input_shape[ax] for ax in self.axis)
-        self.para_shape = tuple(input_shape[ax] if ax in self.axis else 1 for ax in range(1, len(input_shape)))
-    
-    def build_weight(self, add_name=""):
-        gamma, beta = 1., 0.
-        if self.scale:
-            gamma = self.add_weight(
-                name=f'gamma{add_name}',
-                shape=self.shape,
-                initializer=self.gamma_initializer,
-                regularizer=self.gamma_regularizer,
-                trainable=True
-            )
-        if self.center:
-            beta = self.add_weight(
-                name=f'beta{add_name}',
-                shape=self.shape,
-                initializer=self.beta_initializer,
-                regularizer=self.beta_regularizer,
-                trainable=True
-            )
+#     def build(self, input_shape):
+#         self.axis = [len(input_shape) + ax if ax < 0 else ax for ax in self.axis]
+#         shape = tuple(input_shape[ax] for ax in self.axis)
+#         self.para_shape = tuple(input_shape[ax] if ax in self.axis else 1 for ax in range(1, len(input_shape)))
         
-        return gamma, beta
+#         if self.scale:
+#             self.gamma = self.add_weight(
+#                 name='gamma',
+#                 shape=shape,
+#                 initializer=self.init(self.gamma_initializer),
+#                 regularizer=self.gamma_regularizer,
+#                 trainable=True
+#             )
+#         if self.center:
+#             self.beta = self.add_weight(
+#                 name='beta',
+#                 shape=shape,
+#                 initializer=self.init(self.beta_initializer),
+#                 regularizer=self.beta_regularizer,
+#                 trainable=True
+#             )
 
-    @tf.function
-    def _get_normalize(self, inputs, training=None):        
-        mean = tf.math.reduce_mean(inputs, axis=self.reduce_axis, keepdims=True)
-        variance = tf.math.reduce_mean(tf.math.square(inputs - mean), axis=self.reduce_axis, keepdims=True)
-        std = tf.sqrt(variance + self.epsilon)
-        outputs = (inputs - mean) / std
-        if self.scale:
-            outputs *= tf.reshape(self.gamma, self.para_shape)
-        if self.center:
-            outputs += tf.reshape(self.beta, self.para_shape)
-        return outputs
+#     @tf.function
+#     def call(self, inputs, training=None):        
+#         mean = tf.math.reduce_mean(inputs, axis=self.reduce_axis, keepdims=True)
+#         variance = tf.math.reduce_mean(tf.math.square(inputs - mean), axis=self.reduce_axis, keepdims=True)
+#         std = tf.sqrt(variance + self.epsilon)
+#         outputs = (inputs - mean) / std
+#         if self.scale:
+#             outputs *= tf.reshape(self.gamma, self.para_shape)
+#         if self.center:
+#             outputs += tf.reshape(self.beta, self.para_shape)
+#         return outputs
 
-#%%
-class LayerNormalization(BaseNormalization):
-    '''
-        axis: at which reduce dimension; different from InstanceNormalization
-        1. CNN : compute statistics across (Height, Width, Channel)
-        e.g. input_shape = (Batch, Height, Width, Channel); axis=(1,2,3)
-        2. RNN : compute statistics across (Channel) ONLY but NOT (Time)
-        e.g. input_shape = (Batch, Time, Frequency, Channel); axis=(2,3)
-        3. Use TimeDistributed for (Batch, Time, Height, Width, Channel) and see CNN
-    '''
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+# #%%
+# class LayerNormalization(BaseNormalization):
+#     '''
+#         axis: at which reduce dimension; different from InstanceNormalization
+#         1. CNN : compute statistics across (Height, Width, Channel)
+#         e.g. input_shape = (Batch, Height, Width, Channel); axis=(1,2,3)
+#         2. RNN : compute statistics across (Channel) ONLY but NOT (Time)
+#         e.g. input_shape = (Batch, Time, Frequency, Channel); axis=(2,3)
+#         3. Use TimeDistributed for (Batch, Time, Height, Width, Channel) and see CNN
+#     '''
+#     def __init__(self, **kwargs):
+#         super().__init__(**kwargs)
 
-    def build(self, input_shape):
-        super().build(input_shape)
-        self.gamma, self.beta = self.build_weight()
-        self.reduce_axis = self.axis                # Only difference against InstanceNormalization
-    
-    @tf.function
-    def call(self, inputs, training=None):
-        outputs = self._get_normalize(inputs, training)
-        
-        return outputs
+#     def build(self, input_shape):
+#         super().build(input_shape)
+#         self.reduce_axis = self.axis                # Only difference against InstanceNormalization
 
-class ComplexLayerNormalization(BaseNormalization):
-    '''
-        axis: at which reduce dimension; different from InstanceNormalization
-        1. CNN : compute statistics across (Height, Width, Channel)
-        e.g. input_shape = (Batch, Height, Width, Channel); axis=(1,2,3)
-        2. RNN : compute statistics across (Channel) ONLY but NOT (Time)
-        e.g. input_shape = (Batch, Time, Frequency, Channel); axis=(2,3)
-        3. Use TimeDistributed for (Batch, Time, Height, Width, Channel) and see CNN
-    '''
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def build(self, input_shape):
-        super().build(input_shape)
-        self.gamma_r, self.beta_r = self.build_weight(add_name=" real")
-        self.gamma_i, self.beta_i = self.build_weight(add_name=" imag")
-        self.reduce_axis = self.axis                # Only difference against InstanceNormalization
-    
-    @tf.function
-    def call(self, inputs, training=None):
-        self.gamma = tf.complex(self.gamma_r, self.gamma_i)
-        self.beta = tf.complex(self.beta_r, self.beta_i)
-        outputs = self._get_normalize(inputs, training)
-        
-        return outputs
+# class ComplexLayerNormalization(LayerNormalization):
+#     def __init__(self, dtype=tf.complex64, **kwargs):
+#         super().__init__(dtype=dtype, **kwargs)
+#         self.init = complex_initializer
 
 
-#%%
-class InstanceNormalization(BaseNormalization):
-    '''
-        axis: at which channel locate; different from LayerNormalization
-        compute statistics across (Height, Width) ONLY
-        e.g. input_shape = (Batch, Height, Width, Channel); axis=-1
-        e.g. input_shape = (Batch, Time, Frequency, Channel); axis=-1
-    '''
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        
-
-    def build(self, input_shape):
-        super().build(input_shape)
-        self.gamma, self.beta = self.build_weight()
-        self.reduce_axis = [ax for ax in range(1, len(input_shape)) if ax not in self.axis]
-
-    @tf.function
-    def call(self, inputs, training=None):
-        outputs = self._get_normalize(inputs, training)
-        
-        return outputs
-    
-class ComplexInstanceNormalization(BaseNormalization):
-    '''
-        axis: at which channel locate; different from LayerNormalization
-        compute statistics across (Height, Width) ONLY
-        e.g. input_shape = (Batch, Height, Width, Channel); axis=-1
-        e.g. input_shape = (Batch, Time, Frequency, Channel); axis=-1
-    '''
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+# #%%
+# class InstanceNormalization(BaseNormalization):
+#     '''
+#         axis: at which channel locate; different from LayerNormalization
+#         compute statistics across (Height, Width) ONLY
+#         e.g. input_shape = (Batch, Height, Width, Channel); axis=-1
+#         e.g. input_shape = (Batch, Time, Frequency, Channel); axis=-1
+#     '''
+#     def __init__(self, **kwargs):
+#         super().__init__(**kwargs)
         
 
-    def build(self, input_shape):
-        super().build(input_shape)
-        self.gamma_r, self.beta_r = self.build_weight(add_name=" real")
-        self.gamma_i, self.beta_i = self.build_weight(add_name=" imag")
-        self.reduce_axis = [ax for ax in range(1, len(input_shape)) if ax not in self.axis]
+#     def build(self, input_shape):
+#         super().build(input_shape)
+#         self.reduce_axis = [ax for ax in range(1, len(input_shape)) if ax not in self.axis]
 
-    @tf.function
-    def call(self, inputs, training=None):
-        self.gamma = tf.complex(self.gamma_r, self.gamma_i)
-        self.beta = tf.complex(self.beta_r, self.beta_i)
-        outputs = self._get_normalize(inputs, training)
-        
-        return outputs
+# class ComplexInstanceNormalization(InstanceNormalization):
+#     def __init__(self, dtype=tf.complex64, **kwargs):
+#         super().__init__(dtype=dtype, **kwargs)
+#         self.init = complex_initializer
